@@ -67,7 +67,7 @@ pub fn Handle(
     const UInt = utils.UInt;
     const AddressableUInt = utils.AddressableUInt;
 
-    return extern struct {
+    return packed struct(Id) {
         const Self = @This();
 
         const HandleType = Self;
@@ -275,4 +275,18 @@ test "Handle.format()" {
     var buffer = [_]u8{0} ** 128;
     const s = try bufPrint(buffer[0..], "{}", .{h});
     try expectEqualStrings("handle.test.Handle.format().Foo[0#1]", s);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+test "Handle equality" {
+    const expect = std.testing.expect;
+    const expectEqual = std.testing.expectEqual;
+
+    const H = Handle(4, 4, void);
+    try expectEqual(H.nil, H.nil);
+    try expect(H.nil == H.nil);
+    try expectEqual(H{ .id = 1 }, H{ .id = 1 });
+    try expect(H{ .id = 1 } == H{ .id = 1 });
+    try expect(H.nil != H{ .id = 1 });
 }
