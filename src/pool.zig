@@ -50,7 +50,7 @@ pub const HandleError = error{
 /// // once the texture is no longer needed, release it.
 /// _ = pool.removeIfLive(handle);
 /// ```
-pub fn Pool(
+pub fn PoolUnmanaged(
     comptime index_bits: u8,
     comptime cycle_bits: u8,
     comptime TResource: type,
@@ -119,7 +119,6 @@ pub fn Pool(
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-        _allocator: Allocator = undefined,
         _storage: Storage = .{},
         _free_queue: FreeQueue = .{},
         _curr_cycle: []AddressableCycle = &.{},
@@ -130,8 +129,8 @@ pub fn Pool(
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations.  The `Pool` stores all handles and columns in a single
         /// memory allocation backed by `std.MultiArrayList`.
-        pub fn init(allocator: Allocator) Self {
-            var self = Self{ ._allocator = allocator };
+        pub fn init() Self {
+            var self = Self{};
             updateSlices(&self);
             return self;
         }
@@ -139,8 +138,8 @@ pub fn Pool(
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations, with at least `min_capacity` preallocated.
         pub fn initCapacity(allocator: Allocator, min_capacity: usize) !Self {
-            var self = Self{ ._allocator = allocator };
-            try self.reserve(min_capacity);
+            var self = Self{};
+            try self.reserve(allocator, min_capacity);
             return self;
         }
 
@@ -150,10 +149,10 @@ pub fn Pool(
             return initCapacity(allocator, max_capacity);
         }
 
-        /// Releases all resources assocated with an initialized pool.
-        pub fn deinit(self: *Self) void {
+        /// Releases all resources associated with an initialized pool.
+        pub fn deinit(self: *Self, allocator: Allocator) void {
             self.clear();
-            self._storage.deinit(self._allocator);
+            self._storage.deinit(allocator);
             self.* = .{};
         }
 
@@ -168,7 +167,7 @@ pub fn Pool(
         /// Requests the capacity of the pool be at least `min_capacity`.
         /// If the pool `capacity()` is already equal to or greater than
         /// `min_capacity`, `reserve()` has no effect.
-        pub fn reserve(self: *Self, min_capacity: usize) !void {
+        pub fn reserve(self: *Self, allocator: Allocator, min_capacity: usize) !void {
             const old_capacity = self._storage.capacity;
             if (min_capacity <= old_capacity)
                 return;
@@ -176,7 +175,7 @@ pub fn Pool(
             if (min_capacity > max_capacity)
                 return Error.PoolIsFull;
 
-            try self._storage.setCapacity(self._allocator, min_capacity);
+            try self._storage.setCapacity(allocator, min_capacity);
             updateSlices(self);
         }
 
@@ -268,8 +267,8 @@ pub fn Pool(
         /// returns one of:
         /// * `Error.PoolIsFull`
         /// * `Allocator.Error.OutOfMemory`
-        pub fn add(self: *Self, values: Columns) !Handle {
-            const ahandle = try self.acquireAddressableHandle();
+        pub fn add(self: *Self, allocator: Allocator, values: Columns) !Handle {
+            const ahandle = try self.acquireAddressableHandleAlloc(allocator);
             self.initColumnsAt(ahandle.index, values);
             return ahandle.handle();
         }
@@ -277,20 +276,22 @@ pub fn Pool(
         /// Adds `values` and returns a live `Handle` if possible, otherwise
         /// returns null.
         pub fn addIfNotFull(self: *Self, values: Columns) ?Handle {
-            const ahandle = self.acquireAddressableHandle() catch {
+            if (self.acquireAddressableHandle() catch {
                 return null;
-            };
-            self.initColumnsAt(ahandle.index, values);
-            return ahandle.handle();
+            }) |ahandle| {
+                self.initColumnsAt(ahandle.index, values);
+                return ahandle.handle();
+            }
+            return null;
         }
 
         /// Adds `values` and returns a live `Handle` if possible, otherwise
         /// calls `std.debug.assert(false)` and returns `Handle.nil`.
         pub fn addAssumeNotFull(self: *Self, values: Columns) Handle {
-            const ahandle = self.acquireAddressableHandle() catch {
+            const ahandle = (self.acquireAddressableHandle() catch {
                 assert(false);
                 return Handle.nil;
-            };
+            }).?;
             self.initColumnsAt(ahandle.index, values);
             return ahandle.handle();
         }
@@ -572,7 +573,7 @@ pub fn Pool(
                 return Error.HandleIsReleased;
         }
 
-        fn acquireAddressableHandle(self: *Self) !AddressableHandle {
+        fn acquireAddressableHandle(self: *Self) !?AddressableHandle {
             if (self._storage.len == max_capacity) {
                 return Error.PoolIsFull;
             }
@@ -589,7 +590,15 @@ pub fn Pool(
                 return handle;
             }
 
-            try self.getNewHandleAfterResize(&handle);
+            return null;
+        }
+
+        fn acquireAddressableHandleAlloc(self: *Self, allocator: Allocator) !AddressableHandle {
+            if (try self.acquireAddressableHandle()) |handle|
+                return handle;
+
+            var handle = AddressableHandle{};
+            try self.getNewHandleAfterResize(allocator, &handle);
             assert(self.isLiveAddressableHandle(handle));
             return handle;
         }
@@ -675,12 +684,306 @@ pub fn Pool(
             return false;
         }
 
-        fn getNewHandleAfterResize(self: *Self, handle: *AddressableHandle) !void {
-            const new_index = try self._storage.addOne(self._allocator);
+        fn getNewHandleAfterResize(self: *Self, allocator: Allocator, handle: *AddressableHandle) !void {
+            const new_index = try self._storage.addOne(allocator);
             updateSlices(self);
             self._curr_cycle[new_index] = 1;
             handle.index = @as(AddressableIndex, @intCast(new_index));
             handle.cycle = 1;
+        }
+    };
+}
+
+pub fn Pool(
+    comptime index_bits: u8,
+    comptime cycle_bits: u8,
+    comptime TResource: type,
+    comptime TColumns: type,
+) type {
+    const Allocator = std.mem.Allocator;
+
+    return struct {
+        const Self = @This();
+
+        const Unmanaged = PoolUnmanaged(index_bits, cycle_bits, TResource, TColumns);
+        pub const Error = Unmanaged.Error;
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        pub const Resource = Unmanaged.Resource;
+        pub const Handle = Unmanaged.Handle;
+
+        pub const AddressableHandle = Unmanaged.AddressableHandle;
+        pub const AddressableIndex = Unmanaged.AddressableIndex;
+        pub const AddressableCycle = Unmanaged.AddressableCycle;
+
+        pub const max_index: usize = Unmanaged.max_index;
+        pub const max_cycle: usize = Unmanaged.max_cycle;
+        pub const max_capacity: usize = Unmanaged.max_capacity;
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        pub const Columns = Unmanaged.Columns;
+        pub const ColumnSlices = Unmanaged.ColumnSlices;
+        pub const Column = Unmanaged.Column;
+
+        pub const column_fields = Unmanaged.column_fields;
+        pub const column_count = Unmanaged.column_count;
+
+        pub fn ColumnType(comptime column: Column) type {
+            return Unmanaged.ColumnType(column);
+        }
+
+        unmanaged: Unmanaged,
+        allocator: Allocator,
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Returns an initialized `Pool` that will use `allocator` for all
+        /// allocations.  The `Pool` stores all handles and columns in a single
+        /// memory allocation backed by `std.MultiArrayList`.
+        pub fn init(allocator: Allocator) Self {
+            return Self{
+                .allocator = allocator,
+                .unmanaged = Unmanaged.init(),
+            };
+        }
+
+        /// Returns an initialized `Pool` that will use `allocator` for all
+        /// allocations, with at least `min_capacity` preallocated.
+        pub fn initCapacity(allocator: Allocator, min_capacity: usize) !Self {
+            return Self{
+                .allocator = allocator,
+                .unmanaged = try Unmanaged.initCapacity(allocator, min_capacity),
+            };
+        }
+
+        /// Returns an initialized `Pool` that will use `allocator` for all
+        /// allocations, with the `Pool.max_capacity` preallocated.
+        pub fn initMaxCapacity(allocator: Allocator) !Self {
+            return Self{
+                .allocator = allocator,
+                .unmanaged = try Unmanaged.initMaxCapacity(allocator),
+            };
+        }
+
+        /// Releases all resources associated with an initialized pool.
+        pub fn deinit(self: *Self) void {
+            self.unmanaged.deinit(self.allocator);
+            self.* = undefined;
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Returns the capacity of the pool, i.e. the maximum number of handles
+        /// it can contain without allocating additional memory.
+        pub fn capacity(self: Self) usize {
+            return self.unmanaged.capacity();
+        }
+
+        /// Requests the capacity of the pool be at least `min_capacity`.
+        /// If the pool `capacity()` is already equal to or greater than
+        /// `min_capacity`, `reserve()` has no effect.
+        pub fn reserve(self: *Self, min_capacity: usize) !void {
+            return self.unmanaged.reserve(self.allocator, min_capacity);
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Returns the number of live handles.
+        pub fn liveHandleCount(self: Self) usize {
+            return self.unmanaged.liveHandleCount();
+        }
+
+        /// Returns `true` if `handle` is live, otherwise `false`.
+        pub fn isLiveHandle(self: Self, handle: Handle) bool {
+            return self.unmanaged.isLiveHandle(handle);
+        }
+
+        /// Checks whether `handle` is live.
+        /// Unlike `std.debug.assert()`, this check is evaluated in all builds.
+        pub fn requireLiveHandle(self: Self, handle: Handle) HandleError!void {
+            try self.unmanaged.requireLiveHandle(handle);
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Returns an iterator that can enumerate each live index.
+        /// The iterator is invalidated by calls to `add()`.
+        pub fn liveIndices(self: Self) LiveIndexIterator {
+            return self.unmanaged.liveIndices();
+        }
+
+        pub const LiveIndexIterator = Unmanaged.LiveIndexIterator;
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Returns an iterator that can enumerate each live handle.
+        /// The iterator is invalidated by calls to `add()`.
+        pub fn liveHandles(self: Self) LiveHandleIterator {
+            return self.unmanaged.liveHandles();
+        }
+
+        pub const LiveHandleIterator = Unmanaged.LiveHandleIterator;
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Releases all live `Handles` and calls `deinit()` on columns if
+        /// defined.
+        pub fn clear(self: *Self) void {
+            self.unmanaged.clear();
+        }
+
+        /// Adds `values` and returns a live `Handle` if possible, otherwise
+        /// returns one of:
+        /// * `Error.PoolIsFull`
+        /// * `Allocator.Error.OutOfMemory`
+        pub fn add(self: *Self, values: Columns) !Handle {
+            return self.unmanaged.add(self.allocator, values);
+        }
+
+        /// Adds `values` and returns a live `Handle` if possible, otherwise
+        /// returns null.
+        pub fn addIfNotFull(self: *Self, values: Columns) ?Handle {
+            return self.unmanaged.addIfNotFull(values);
+        }
+
+        /// Adds `values` and returns a live `Handle` if possible, otherwise
+        /// calls `std.debug.assert(false)` and returns `Handle.nil`.
+        pub fn addAssumeNotFull(self: *Self, values: Columns) Handle {
+            return self.unmanaged.addAssumeNotFull(values);
+        }
+
+        /// Removes (and invalidates) `handle` if live.
+        pub fn remove(self: *Self, handle: Handle) HandleError!void {
+            try self.unmanaged.remove(handle);
+        }
+
+        /// Removes (and invalidates) `handle` if live.
+        /// Returns `true` if removed, otherwise `false`.
+        pub fn removeIfLive(self: *Self, handle: Handle) bool {
+            return self.unmanaged.removeIfLive(handle);
+        }
+
+        /// Attempts to remove (and invalidates) `handle` assuming it is live.
+        /// Liveness of `handle` is checked by `std.debug.assert()`.
+        pub fn removeAssumeLive(self: *Self, handle: Handle) void {
+            return self.unmanaged.removeAssumeLive(handle);
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Gets a column pointer if `handle` is live.
+        pub fn getColumnPtr(self: Self, handle: Handle, comptime column: Column) HandleError!*ColumnType(column) {
+            return self.unmanaged.getColumnPtr(handle, column);
+        }
+
+        /// Gets a column value if `handle` is live.
+        pub fn getColumn(self: Self, handle: Handle, comptime column: Column) HandleError!ColumnType(column) {
+            return self.unmanaged.getColumn(handle, column);
+        }
+
+        /// Gets column values if `handle` is live.
+        pub fn getColumns(self: Self, handle: Handle) HandleError!Columns {
+            return self.unmanaged.getColumns(handle);
+        }
+
+        /// Sets a column value if `handle` is live.
+        pub fn setColumn(self: Self, handle: Handle, comptime column: Column, value: ColumnType(column)) HandleError!void {
+            return self.unmanaged.setColumn(handle, column, value);
+        }
+
+        /// Sets column values if `handle` is live.
+        pub fn setColumns(self: Self, handle: Handle, values: Columns) HandleError!void {
+            return self.unmanaged.setColumns(handle, values);
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Gets a column pointer if `handle` is live, otherwise `null`.
+        pub fn getColumnPtrIfLive(self: Self, handle: Handle, comptime column: Column) ?*ColumnType(column) {
+            return self.unmanaged.getColumnPtrIfLive(handle, column);
+        }
+
+        /// Gets a column value if `handle` is live, otherwise `null`.
+        pub fn getColumnIfLive(self: Self, handle: Handle, comptime column: Column) ?ColumnType(column) {
+            return self.unmanaged.getColumnIfLive(handle, column);
+        }
+
+        /// Gets column values if `handle` is live, otherwise `null`.
+        pub fn getColumnsIfLive(self: Self, handle: Handle) ?Columns {
+            return self.unmanaged.getColumnsIfLive(handle);
+        }
+
+        /// Sets a column value if `handle` is live.
+        /// Returns `true` if the column value was set, otherwise `false`.
+        pub fn setColumnIfLive(self: Self, handle: Handle, comptime column: Column, value: ColumnType(column)) bool {
+            return self.unmanaged.setColumnIfLive(handle, column, value);
+        }
+
+        /// Sets column values if `handle` is live.
+        /// Returns `true` if the column value was set, otherwise `false`.
+        pub fn setColumnsIfLive(self: Self, handle: Handle, values: Columns) bool {
+            return self.unmanaged.setColumnsIfLive(handle, values);
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Attempts to get a column pointer assuming `handle` is live.
+        /// Liveness of `handle` is checked by `std.debug.assert()`.
+        pub fn getColumnPtrAssumeLive(self: Self, handle: Handle, comptime column: Column) *ColumnType(column) {
+            return self.unmanaged.getColumnPtrAssumeLive(handle, column);
+        }
+
+        /// Attempts to get a column value assuming `handle` is live.
+        /// Liveness of `handle` is checked by `std.debug.assert()`.
+        pub fn getColumnAssumeLive(self: Self, handle: Handle, comptime column: Column) ColumnType(column) {
+            return self.unmanaged.getColumnAssumeLive(handle, column);
+        }
+
+        /// Attempts to get column values assuming `handle` is live.
+        /// Liveness of `handle` is checked by `std.debug.assert()`.
+        pub fn getColumnsAssumeLive(self: Self, handle: Handle) Columns {
+            return self.unmanaged.getColumnsAssumeLive(handle);
+        }
+
+        /// Attempts to set a column value assuming `handle` is live.
+        /// Liveness of `handle` is checked by `std.debug.assert()`.
+        pub fn setColumnAssumeLive(self: Self, handle: Handle, comptime column: Column, value: ColumnType(column)) void {
+            return self.unmanaged.setColumnAssumeLive(handle, column, value);
+        }
+
+        /// Attempts to set column values assuming `handle` is live.
+        /// Liveness of `handle` is checked by `std.debug.assert()`.
+        pub fn setColumnsAssumeLive(self: Self, handle: Handle, values: Columns) void {
+            return self.unmanaged.setColumnsAssumeLive(handle, values);
+        }
+
+        // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+        /// Gets a column pointer. In most cases, `getColumnPtrAssumeLive` should be used instead.
+        pub fn getColumnPtrUnchecked(self: Self, handle: AddressableHandle, comptime column: Column) *ColumnType(column) {
+            return self.unmanaged.getColumnPtrUnchecked(handle, column);
+        }
+
+        /// Gets a column value. In most cases, `getColumnAssumeLive` should be used instead.
+        pub fn getColumnUnchecked(self: Self, handle: AddressableHandle, comptime column: Column) ColumnType(column) {
+            return self.unmanaged.getColumnUnchecked(handle, column);
+        }
+
+        /// Gets column values. In most cases, `getColumnsAssumeLive` should be used instead.
+        pub fn getColumnsUnchecked(self: Self, handle: AddressableHandle) Columns {
+            return self.unmanaged.getColumnsUnchecked(handle);
+        }
+
+        /// Sets a column value. In most cases, `setColumnAssumeLive` should be used instead.
+        pub fn setColumnUnchecked(self: Self, handle: AddressableHandle, comptime column: Column, value: ColumnType(column)) void {
+            return self.unmanaged.setColumnUnchecked(handle, column, value);
+        }
+
+        /// Sets column values. In most cases, `setColumnsAssumeLive` should be used instead.
+        pub fn setColumnsUnchecked(self: Self, handle: AddressableHandle, values: Columns) void {
+            return self.unmanaged.setColumnsUnchecked(handle, values);
         }
     };
 }
