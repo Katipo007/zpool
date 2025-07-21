@@ -8,6 +8,56 @@ pub const HandleError = error{
     HandleIsReleased,
 };
 
+pub fn ColumnsDeinitialiser(comptime TColumns: type) type {
+    return struct {
+        pub const VTable = struct {
+            deinit_columns: *const fn (ctx: *anyopaque, columns: *TColumns) void,
+            deinit: ?*const fn (ctx: *anyopaque) void = null,
+        };
+
+        ctx: *anyopaque,
+        vtable: *const VTable,
+
+        pub fn deinit(self: *@This()) void {
+            if (self.vtable.deinit) |func| {
+                func(self.ctx);
+            }
+            self.* = undefined;
+        }
+
+        pub fn deinit_columns(self: @This(), columns: *TColumns) void {
+            self.vtable.deinit_columns(self.ctx, columns);
+        }
+
+        pub const default = bk: {
+            const Helper = struct {
+                fn default_deinit(_: *anyopaque, columns: *TColumns) void {
+                    if (@hasDecl(TColumns, "deinit")) {
+                        columns.deinit();
+                    } else {
+                        inline for (std.meta.fields(TColumns)) |column_field| {
+                            switch (@typeInfo(column_field.type)) {
+                                .@"struct", .@"enum", .@"union", .@"opaque" => {
+                                    if (@hasDecl(column_field.type, "deinit")) {
+                                        @field(columns, column_field.name).deinit();
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            };
+            break :bk @This(){
+                .ctx = undefined,
+                .vtable = &VTable{
+                    .deinit_columns = &Helper.default_deinit,
+                },
+            };
+        };
+    };
+}
+
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 /// Returns a struct that maintains a pool of data.  Handles returned by
@@ -83,6 +133,7 @@ pub fn PoolUnmanaged(
         pub const AddressableHandle = Handle.AddressableHandle;
         pub const AddressableIndex = Handle.AddressableIndex;
         pub const AddressableCycle = Handle.AddressableCycle;
+        pub const Deinitialiser = ColumnsDeinitialiser(TColumns);
 
         pub const max_index: usize = Handle.max_index;
         pub const max_cycle: usize = Handle.max_cycle;
@@ -123,36 +174,42 @@ pub fn PoolUnmanaged(
         _free_queue: FreeQueue = .{},
         _curr_cycle: []AddressableCycle = &.{},
         columns: ColumnSlices = undefined,
+        deinitialiser: Deinitialiser = undefined,
 
         // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations.  The `Pool` stores all handles and columns in a single
         /// memory allocation backed by `std.MultiArrayList`.
-        pub fn init() Self {
-            var self = Self{};
+        pub fn init(deinitialiser: Deinitialiser) Self {
+            var self = Self{
+                .deinitialiser = deinitialiser,
+            };
             updateSlices(&self);
             return self;
         }
 
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations, with at least `min_capacity` preallocated.
-        pub fn initCapacity(allocator: Allocator, min_capacity: usize) !Self {
-            var self = Self{};
+        pub fn initCapacity(allocator: Allocator, min_capacity: usize, deinitialiser: Deinitialiser) !Self {
+            var self = Self{
+                .deinitialiser = deinitialiser,
+            };
             try self.reserve(allocator, min_capacity);
             return self;
         }
 
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations, with the `Pool.max_capacity` preallocated.
-        pub fn initMaxCapacity(allocator: Allocator) !Self {
-            return initCapacity(allocator, max_capacity);
+        pub fn initMaxCapacity(allocator: Allocator, deinitialiser: Deinitialiser) !Self {
+            return initCapacity(allocator, max_capacity, deinitialiser);
         }
 
         /// Releases all resources associated with an initialized pool.
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.clear();
             self._storage.deinit(allocator);
+            self.deinitialiser.deinit();
             self.* = .{};
         }
 
@@ -509,23 +566,16 @@ pub fn PoolUnmanaged(
             }
         }
 
-        /// Call `values.deinit()` if defined.
         fn deinitColumnsAt(self: Self, index: AddressableIndex) void {
-            if (@hasDecl(Columns, "deinit")) {
-                var values: Columns = undefined;
-                inline for (column_fields) |column_field| {
-                    @field(values, column_field.name) =
-                        @field(self.columns, column_field.name)[index];
-                }
-                values.deinit();
-                inline for (column_fields) |column_field| {
-                    @field(self.columns, column_field.name)[index] =
-                        @field(values, column_field.name);
-                }
-            } else {
-                inline for (column_fields) |column_field| {
-                    self.deinitColumnAt(index, column_field);
-                }
+            var values: Columns = undefined;
+            inline for (column_fields) |column_field| {
+                @field(values, column_field.name) =
+                    @field(self.columns, column_field.name)[index];
+            }
+            self.deinitialiser.deinit_columns(&values);
+            inline for (column_fields) |column_field| {
+                @field(self.columns, column_field.name)[index] =
+                    @field(values, column_field.name);
             }
         }
 
@@ -716,6 +766,7 @@ pub fn Pool(
         pub const AddressableHandle = Unmanaged.AddressableHandle;
         pub const AddressableIndex = Unmanaged.AddressableIndex;
         pub const AddressableCycle = Unmanaged.AddressableCycle;
+        pub const Deinitialiser = Unmanaged.Deinitialiser;
 
         pub const max_index: usize = Unmanaged.max_index;
         pub const max_cycle: usize = Unmanaged.max_cycle;
@@ -742,28 +793,28 @@ pub fn Pool(
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations.  The `Pool` stores all handles and columns in a single
         /// memory allocation backed by `std.MultiArrayList`.
-        pub fn init(allocator: Allocator) Self {
+        pub fn init(allocator: Allocator, deinitialiser: Deinitialiser) Self {
             return Self{
                 .allocator = allocator,
-                .unmanaged = Unmanaged.init(),
+                .unmanaged = Unmanaged.init(deinitialiser),
             };
         }
 
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations, with at least `min_capacity` preallocated.
-        pub fn initCapacity(allocator: Allocator, min_capacity: usize) !Self {
+        pub fn initCapacity(allocator: Allocator, min_capacity: usize, deinitialiser: Deinitialiser) !Self {
             return Self{
                 .allocator = allocator,
-                .unmanaged = try Unmanaged.initCapacity(allocator, min_capacity),
+                .unmanaged = try Unmanaged.initCapacity(allocator, min_capacity, deinitialiser),
             };
         }
 
         /// Returns an initialized `Pool` that will use `allocator` for all
         /// allocations, with the `Pool.max_capacity` preallocated.
-        pub fn initMaxCapacity(allocator: Allocator) !Self {
+        pub fn initMaxCapacity(allocator: Allocator, deinitialiser: Deinitialiser) !Self {
             return Self{
                 .allocator = allocator,
-                .unmanaged = try Unmanaged.initMaxCapacity(allocator),
+                .unmanaged = try Unmanaged.initMaxCapacity(allocator, deinitialiser),
             };
         }
 
@@ -1012,7 +1063,7 @@ const DeinitCounter = struct {
 
 test "Pool.init()" {
     const TestPool = Pool(8, 8, void, struct {});
-    var pool = TestPool.init(std.testing.allocator);
+    var pool = TestPool.init(std.testing.allocator, .default);
     defer pool.deinit();
 }
 
@@ -1021,7 +1072,7 @@ test "Pool with no columns" {
     try expectEqual(@as(usize, 0), TestPool.column_count);
     try expectEqual(@as(usize, 0), @sizeOf(TestPool.ColumnSlices));
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     const handle = try pool.add(.{});
@@ -1039,7 +1090,7 @@ test "Pool with one column" {
     try expectEqual(@as(usize, 1), TestPool.column_count);
     try expectEqual(@sizeOf([]u32), @sizeOf(TestPool.ColumnSlices));
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     const handle = try pool.add(.{ .a = 123 });
@@ -1061,7 +1112,7 @@ test "Pool with two columns" {
     try expectEqual(@as(usize, 2), TestPool.column_count);
     try expectEqual(@sizeOf([]u32) * 2, @sizeOf(TestPool.ColumnSlices));
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     const handle = try pool.add(.{ .a = 123, .b = 456 });
@@ -1087,7 +1138,7 @@ test "Pool with two columns" {
 test "Pool.liveHandleCount()" {
     const TestPool = Pool(8, 8, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1116,7 +1167,7 @@ test "Pool.liveHandleCount()" {
 test "Pool.isLiveHandle()" {
     const TestPool = Pool(8, 8, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1141,7 +1192,7 @@ test "Pool.requireLiveHandle()" {
     try expectEqual(@as(usize, 0), TestPool.column_count);
     try expectEqual(@as(usize, 0), @sizeOf(TestPool.ColumnSlices));
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1164,7 +1215,7 @@ test "Pool.requireLiveHandle()" {
 test "Pool.liveIndices()" {
     const TestPool = Pool(8, 8, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1187,7 +1238,7 @@ test "Pool.liveIndices() when full" {
     // at least a u8)
     const TestPool = Pool(8, 8, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1213,7 +1264,7 @@ test "Pool.liveIndices() when full" {
 test "Pool.liveHandles()" {
     const TestPool = Pool(8, 8, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1235,7 +1286,7 @@ test "Pool.liveHandles()" {
 test "Pool.clear()" {
     const TestPool = Pool(8, 8, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1258,7 +1309,7 @@ test "Pool.clear()" {
 test "Pool.clear() calls Columns.deinit()" {
     const TestPool = Pool(2, 6, void, DeinitCounter);
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1271,7 +1322,7 @@ test "Pool.clear() calls Columns.deinit()" {
 test "Pool.clear() calls ColumnType.deinit()" {
     const TestPool = Pool(2, 6, void, struct { a: DeinitCounter, b: DeinitCounter });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1291,7 +1342,7 @@ test "Pool.add()" {
     try expectEqual(@sizeOf(u8), @sizeOf(TestPool.Handle));
     try expectEqual(@as(usize, 4), TestPool.max_capacity);
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1313,7 +1364,7 @@ test "Pool.add()" {
 test "Pool.remove()" {
     const TestPool = Pool(2, 6, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1335,7 +1386,7 @@ test "Pool.remove()" {
 test "Pool.remove() calls Columns.deinit()" {
     const TestPool = Pool(2, 6, void, DeinitCounter);
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1348,7 +1399,7 @@ test "Pool.remove() calls Columns.deinit()" {
 test "Pool.remove() calls ColumnType.deinit()" {
     const TestPool = Pool(2, 6, void, struct { a: DeinitCounter, b: DeinitCounter });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1366,7 +1417,7 @@ test "Pool.remove() calls ColumnType.deinit()" {
 test "Pool.removeIfLive()" {
     const TestPool = Pool(2, 6, void, struct {});
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1399,7 +1450,7 @@ test "Pool.removeIfLive()" {
 test "Pool.removeIfLive() calls Columns.deinit()" {
     const TestPool = Pool(2, 6, void, DeinitCounter);
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1412,7 +1463,7 @@ test "Pool.removeIfLive() calls Columns.deinit()" {
 test "Pool.removeIfLive() calls ColumnType.deinit()" {
     const TestPool = Pool(2, 6, void, struct { a: DeinitCounter, b: DeinitCounter });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1430,7 +1481,7 @@ test "Pool.removeIfLive() calls ColumnType.deinit()" {
 test "Pool.getColumnPtr*()" {
     const TestPool = Pool(2, 6, void, struct { a: u32 });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1476,7 +1527,7 @@ test "Pool.getColumnPtr*()" {
 test "Pool.getColumn*()" {
     const TestPool = Pool(2, 6, void, struct { a: u32 });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1518,7 +1569,7 @@ test "Pool.getColumn*()" {
 test "Pool.setColumn*()" {
     const TestPool = Pool(2, 6, void, struct { a: u32 });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1586,7 +1637,7 @@ test "Pool.setColumn*()" {
 test "Pool.setColumn*() calls ColumnType.deinit()" {
     const TestPool = Pool(2, 6, void, struct { a: DeinitCounter, b: DeinitCounter });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1617,7 +1668,7 @@ test "Pool.setColumn*() calls ColumnType.deinit()" {
 test "Pool.setColumns*()" {
     const TestPool = Pool(2, 6, void, struct { a: u32 });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     try expectEqual(@as(usize, 0), pool.liveHandleCount());
@@ -1685,7 +1736,7 @@ test "Pool.setColumns*()" {
 test "Pool.setColumns() calls Columns.deinit()" {
     const TestPool = Pool(2, 6, void, DeinitCounter);
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1705,7 +1756,7 @@ test "Pool.setColumns() calls Columns.deinit()" {
 test "Pool.setColumns() calls ColumnType.deinit()" {
     const TestPool = Pool(2, 6, void, struct { a: DeinitCounter, b: DeinitCounter });
 
-    var pool = try TestPool.initMaxCapacity(std.testing.allocator);
+    var pool = try TestPool.initMaxCapacity(std.testing.allocator, .default);
     defer pool.deinit();
 
     var deinit_count: u32 = 0;
@@ -1737,7 +1788,7 @@ test "Pool.setColumns() calls ColumnType.deinit()" {
 test "Adds and removes triggering resize" {
     const TestPool = Pool(16, 16, void, struct {});
 
-    var pool = TestPool.init(std.testing.allocator);
+    var pool = TestPool.init(std.testing.allocator, .default);
     defer pool.deinit();
 
     var handles: std.ArrayListUnmanaged(TestPool.Handle) = .empty;
